@@ -241,14 +241,25 @@ Application layer specifications must also contain the following additional fiel
   the stack specification file) that specifies a Python module or import package that will
   be included in the built environment for execution with the :option:`-m` switch.
 
-.. note:: updating the launch module contents does *not* implicitly update the lock version
-          for implicitly versioned environments (but it does update the ``archive_build``
-          field for published artifacts).
+Application layer specifications may also contain the following optional field:
+
+* ``support_modules`` (:toml:`array` of :toml:`strings <string>`):
+  an array of relative paths (each starting from the folder containing the stack specification
+  file) that specify Python modules or import packages that will be included in the built
+  environment for use by the application launch module.
 
 .. versionchanged:: 0.4.0
    Added the ability for application layers to depend directly on a runtime layer instead
    of declaring that they depend on one or more framework layers
    (:ref:`release details <changelog-0.4.0>`).
+
+.. versionchanged:: 0.5.0
+   Updating the name or contents of a launch module also updates the layer version
+   for implicitly versioned layers
+   (:ref:`release details <changelog-0.5.0>`).
+
+.. versionadded:: 0.6.0
+   Added the ``support_modules`` field (:ref:`release details <changelog-0.6.0>`).
 
 .. _layer-dependency-linearization:
 
@@ -336,11 +347,12 @@ Environment lock metadata files saved alongside the layer's transitively locked 
 
 .. code-block:: python
 
-   requirements_hash: str  # Uses "algorithm:hexdigest" format
-   lock_input_hash: str    # Uses "algorithm:hexdigest" format
-   other_inputs_hash: str  # Uses "algorithm:hexdigest" format
-   lock_version: int       # Auto-incremented from previous lock metadata
-   locked_at: str          # ISO formatted date/time value
+   requirements_hash: str   # Uses "algorithm:hexdigest" format
+   lock_input_hash: str     # Uses "algorithm:hexdigest" format
+   other_inputs_hash: str   # Uses "algorithm:hexdigest" format
+   version_inputs_hash: str # Uses "algorithm:hexdigest" format
+   lock_version: int        # Auto-incremented from previous lock metadata
+   locked_at: str           # ISO formatted date/time value
 
 Note: A future documentation update will cover these ``venvstacks lock`` output files in additional detail.
 
