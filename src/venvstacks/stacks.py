@@ -4,7 +4,6 @@
 Creates Python runtime, framework, and app environments based on ``venvstacks.toml``
 """
 
-import hashlib
 import json
 import os
 import shlex
@@ -46,7 +45,9 @@ from typing import (
 )
 
 from . import pack_venv
+from ._hash_content import hash_file_contents, hash_module, hash_strings
 from ._injected import postinstall
+from ._source_tree import SourceTreeContentFilter, get_default_source_filter
 from ._util import (
     as_normalized_path,
     capture_python_output,
@@ -54,6 +55,7 @@ from ._util import (
     find_shared_libraries,
     map_symlink_targets,
     run_python_command,
+    walk_path,
     StrPath,
     WINDOWS_BUILD as _WINDOWS_BUILD,
 )
@@ -193,11 +195,12 @@ class EnvironmentLockMetadata(TypedDict):
     """Details of the last time this environment was locked."""
 
     # fmt: off
-    requirements_hash: str  # Uses "algorithm:hexdigest" format
-    lock_input_hash: str    # Uses "algorithm:hexdigest" format
-    other_inputs_hash: str  # Uses "algorithm:hexdigest" format
-    lock_version: int       # Auto-incremented from previous lock metadata
-    locked_at: str          # ISO formatted date/time value
+    requirements_hash: str    # Uses "algorithm:hexdigest" format
+    lock_input_hash: str      # Uses "algorithm:hexdigest" format
+    other_inputs_hash: str    # Uses "algorithm:hexdigest" format
+    version_inputs_hash: str  # Uses "algorithm:hexdigest" format
+    lock_version: int         # Auto-incremented from previous lock metadata
+    locked_at: str            # ISO formatted date/time value
     # fmt: on
 
 
@@ -211,12 +214,15 @@ class EnvironmentLock:
     locked_requirements_path: Path
     declared_requirements: tuple[str, ...]
     other_inputs: tuple[str, ...]
+    version_inputs: tuple[str, ...]
     versioned: bool = False
     _lock_input_path: Path = field(init=False, repr=False)
     _lock_input_hash: str = field(init=False, repr=False)
     _requirements_hash: str | None = field(init=False, repr=False)
     _legacy_req_hash: str | None = field(init=False, repr=False)
     _other_inputs_hash: str = field(init=False, repr=False)
+    _version_inputs_hash: str = field(init=False, repr=False)
+    _migrate_other_inputs: bool = field(init=False, repr=False)
     _lock_metadata_path: Path = field(init=False, repr=False)
     _last_locked: datetime | None = field(init=False, repr=False)
     _lock_version: int | None = field(init=False, repr=False)
@@ -258,6 +264,12 @@ class EnvironmentLock:
         """Supply an additional "other input" to use when determining lock validity."""
         self.other_inputs = (*self.other_inputs, other_input)
         self._update_other_inputs_hash()
+        self._update_from_valid_lock_info()
+
+    def append_version_input(self, version_input: str) -> None:
+        """Supply an additional "version input" to use when determining lock version validity."""
+        self.version_inputs = (*self.version_inputs, version_input)
+        self._update_version_inputs_hash()
         self._update_from_valid_lock_info()
 
     def extend_other_inputs(self, other_inputs: Sequence[str]) -> None:
@@ -304,7 +316,17 @@ class EnvironmentLock:
     @property
     def has_valid_lock(self) -> bool:
         """``True`` if layer has been locked and lock metadata is consistent."""
+        # For versioned layers, this also indicates the version metadata is up to date
         return self._last_locked is not None and self.load_valid_metadata() is not None
+
+    @property
+    def needs_full_lock(self) -> bool:
+        """``True`` if layer has not been locked or transitive lock metadata is inconsistent."""
+        # For versioned layers, skips checking whether the version metadata is up to date
+        return (
+            self._last_locked is None
+            or self.load_valid_metadata(ignore_version=True) is None
+        )
 
     @property
     def locked_at(self) -> str:
@@ -324,7 +346,7 @@ class EnvironmentLock:
 
     @classmethod
     def _hash_reqs(cls, requirements: Iterable[str]) -> str:
-        return _hash_strings(cls._clean_reqs(requirements))
+        return hash_strings(cls._clean_reqs(requirements))
 
     @classmethod
     def _hash_req_file(cls, requirements_path: Path) -> str | None:
@@ -333,22 +355,28 @@ class EnvironmentLock:
         return cls._hash_reqs(requirements_path.read_text().splitlines())
 
     def _update_other_inputs_hash(self) -> None:
-        self._other_inputs_hash = _hash_strings(self.other_inputs)
+        self._other_inputs_hash = hash_strings(self.other_inputs)
+
+    def _update_version_inputs_hash(self) -> None:
+        self._version_inputs_hash = hash_strings(self.version_inputs)
 
     def _update_hashes(self) -> None:
         self._update_other_inputs_hash()
-        self._other_inputs_hash = _hash_strings(self.other_inputs)
+        self._update_version_inputs_hash()
         self._lock_input_hash = input_hash = self._hash_reqs(self.declared_requirements)
         req_hash = legacy_req_hash = None
+        migrate_other_inputs = False
         last_metadata = self._load_saved_metadata()
         if last_metadata is not None:
+            # TODO: Introduce a cleaner migration mechanism for lock metadata updates
             missing = object()
             last_lock_input_hash = last_metadata.get("lock_input_hash", missing)
+            # 0.5.0 added "lock_input_hash" and changed how "requirements_hash" is calculated
             set_locked_req_hash = False
             if last_lock_input_hash is missing:
-                # Legacy lock metadata, consider it valid if the last hash matches the full file
+                # Pre-0.5.0 lock metadata, consider it valid if the last hash matches the full file
                 # This is technically an unwarranted assumption, but it makes upgrades more flexible
-                legacy_req_hash = _hash_file_contents(self.locked_requirements_path)
+                legacy_req_hash = hash_file_contents(self.locked_requirements_path)
                 set_locked_req_hash = legacy_req_hash == last_metadata.get(
                     "requirements_hash", missing
                 )
@@ -357,8 +385,14 @@ class EnvironmentLock:
             if set_locked_req_hash:
                 # Declared requirements hash is consistent, so also check the locked output hash
                 req_hash = self._hash_req_file(self.locked_requirements_path)
+            # 0.6.0 split "version_inputs_hash" out from "other_inputs_hash"
+            # Exclude both "other_inputs_hash" and "version_inputs_hash" from the
+            # metadata consistency check if the latter is missing
+            last_version_inputs_hash = last_metadata.get("version_inputs_hash", missing)
+            migrate_other_inputs = last_version_inputs_hash is missing
         self._requirements_hash = req_hash
         self._legacy_req_hash = legacy_req_hash
+        self._migrate_other_inputs = migrate_other_inputs
 
     @staticmethod
     def _write_declared_requirements(
@@ -394,7 +428,9 @@ class EnvironmentLock:
             # defined and used for validation when reading the metadata files.
             return cast(EnvironmentLockMetadata, json.load(f))
 
-    def load_valid_metadata(self) -> EnvironmentLockMetadata | None:
+    def load_valid_metadata(
+        self, ignore_version: bool = False
+    ) -> EnvironmentLockMetadata | None:
         """Loads last locked metadata only if the requirements hash matches."""
         # No requirements declaration file -> metadata is not valid
         lock_input_hash = self._lock_input_hash
@@ -410,10 +446,26 @@ class EnvironmentLock:
         if lock_metadata is None:
             return None
         last_req_hash = lock_metadata.get("requirements_hash", None)
+        check_version = (
+            not ignore_version and self.versioned and not self._migrate_other_inputs
+        )
         have_valid_lock = (
             req_hash == last_req_hash
             and lock_input_hash == lock_metadata.get("lock_input_hash", None)
-            and self._other_inputs_hash == lock_metadata.get("other_inputs_hash", None)
+            and (
+                self._migrate_other_inputs
+                or (
+                    self._other_inputs_hash
+                    == lock_metadata.get("other_inputs_hash", None)
+                )
+            )
+            and (
+                not check_version
+                or (
+                    self._version_inputs_hash
+                    == lock_metadata.get("version_inputs_hash", None)
+                )
+            )
         )
         if not have_valid_lock:
             # Also check for consistent legacy lock metadata
@@ -486,6 +538,7 @@ class EnvironmentLock:
             requirements_hash=req_hash,
             lock_input_hash=lock_input_hash,
             other_inputs_hash=self._other_inputs_hash,
+            version_inputs_hash=self._version_inputs_hash,
             lock_version=lock_version,
             locked_at=self.locked_at,
         )
@@ -525,6 +578,7 @@ class EnvironmentLock:
             "lock_input_hash": self._lock_input_hash,
             "requirements_hash": self._requirements_hash,
             "other_inputs_hash": self._other_inputs_hash,
+            "version_inputs_hash": self._version_inputs_hash,
             "_legacy_requirements_hash": self._legacy_req_hash,
             "locked_at": locked_at,
             "lock_version": self._lock_version,
@@ -651,6 +705,10 @@ class LayerSpecBase(ABC):
         requirements_fname = self.get_requirements_fname(platform)
         return Path(requirements_dir) / self.env_name / requirements_fname
 
+    def targets_platform(self, target_platform: str | TargetPlatform) -> bool:
+        """Returns `True` if the layer will be built for the given target platform."""
+        return target_platform in self.platforms
+
 
 @dataclass
 class RuntimeSpec(LayerSpecBase):
@@ -694,6 +752,14 @@ class ApplicationSpec(LayeredSpecBase):
     kind = LayerVariants.APPLICATION
     category = LayerCategories.APPLICATIONS
     launch_module_path: Path = field(repr=False)
+    support_module_paths: list[Path] = field(repr=False)
+
+
+class SupportModuleMetadata(TypedDict):
+    """Details of an unpackaged application support module."""
+
+    name: NotRequired[str]
+    hash: NotRequired[str]
 
 
 class LayerSpecMetadata(TypedDict):
@@ -723,6 +789,7 @@ class LayerSpecMetadata(TypedDict):
     # Extra fields only defined for application environments
     app_launch_module: NotRequired[str]
     app_launch_module_hash: NotRequired[str]
+    app_support_modules: NotRequired[Sequence[SupportModuleMetadata]]
     # fmt: on
 
     # Note: hashes of layered environment dependencies are intentionally NOT incorporated
@@ -875,7 +942,7 @@ class ArchiveBuildRequest:
     def _hash_archive(archive_path: Path) -> ArchiveHashes:
         hashes: dict[str, str] = {}
         for algorithm in ArchiveHashes.__required_keys__:
-            hashes[algorithm] = _hash_file_contents(
+            hashes[algorithm] = hash_file_contents(
                 archive_path, algorithm, omit_prefix=True
             )
         # The required keys have been set, but mypy can't prove that,
@@ -1145,68 +1212,6 @@ def _binary_with_extension(name: str) -> str:
     return f"{name}{binary_suffix}"
 
 
-def _hash_strings(
-    items: Iterable[str], algorithm: str = "sha256", *, omit_prefix: bool = False
-) -> str:
-    incremental_hash = hashlib.new(algorithm)
-    for item in items:
-        incremental_hash.update(item.encode())
-    strings_hash = incremental_hash.hexdigest()
-    if omit_prefix:
-        return strings_hash
-    return f"{algorithm}:{strings_hash}"
-
-
-def _hash_file_contents(
-    path: Path, algorithm: str = "sha256", *, omit_prefix: bool = False
-) -> str:
-    if not path.exists():
-        return ""
-    with path.open("rb", buffering=0) as f:
-        file_hash = hashlib.file_digest(f, algorithm).hexdigest()
-    if omit_prefix:
-        return file_hash
-    return f"{algorithm}:{file_hash}"
-
-
-def _hash_file_name_and_contents(
-    path: Path, algorithm: str = "sha256", *, omit_prefix: bool = False
-) -> str:
-    if not path.exists():
-        return ""
-    incremental_hash = hashlib.new(algorithm)
-    incremental_hash.update(path.name.encode())
-    file_hash = _hash_file_contents(path, algorithm)
-    incremental_hash.update(file_hash.encode())
-    file_and_name_hash = incremental_hash.hexdigest()
-    if omit_prefix:
-        return file_and_name_hash
-    return f"{algorithm}:{file_and_name_hash}"
-
-
-def _hash_directory(
-    path: Path, algorithm: str = "sha256", *, omit_prefix: bool = False
-) -> str:
-    incremental_hash = hashlib.new(algorithm)
-    # Python 3.11 compatibility: use os.walk instead of Path.walk
-    for this_dir, subdirs, files in os.walk(path):
-        if not files:
-            continue
-        dir_path = Path(this_dir)
-        incremental_hash.update(dir_path.name.encode())
-        # Ensure directory tree iteration order is deterministic
-        subdirs.sort()
-        for file in sorted(files):
-            file_path = dir_path / file
-            incremental_hash.update(file_path.name.encode())
-            file_hash = _hash_file_contents(file_path, algorithm)
-            incremental_hash.update(file_hash.encode())
-    dir_hash = incremental_hash.hexdigest()
-    if omit_prefix:
-        return dir_hash
-    return f"{algorithm}/{dir_hash}"
-
-
 def get_build_platform() -> TargetPlatform:
     """Report target platform that matches the currently running system."""
     # Currently no need for cross-build support, so always query the running system
@@ -1240,6 +1245,7 @@ class LayerEnvBase(ABC):
     build_path: Path = field(repr=False)
     requirements_path: Path = field(repr=False)
     index_config: PackageIndexConfig = field(repr=False)
+    source_filter: SourceTreeContentFilter = field(repr=False)
 
     # Derived from target path and spec in __post_init__
     env_path: Path = field(init=False)
@@ -1354,7 +1360,8 @@ class LayerEnvBase(ABC):
         self.env_lock = EnvironmentLock(
             self.requirements_path,
             (*self.env_spec.requirements,),
-            self._get_common_lock_inputs(),
+            self._get_other_lock_inputs(),
+            self._get_lock_version_inputs(),
             self.env_spec.versioned,
         )
         # Ensure symlinks in the environment paths aren't inadvertently resolved
@@ -1362,10 +1369,12 @@ class LayerEnvBase(ABC):
         assert self.executables_path.relative_to(self.env_path)
         assert self.dynlib_path.relative_to(self.env_path)
 
-    def _get_common_lock_inputs(self) -> tuple[str, ...]:
+    def _get_other_lock_inputs(self) -> tuple[str, ...]:
+        return (f"py_version={'.'.join(self._py_version_info)}",)
+
+    def _get_lock_version_inputs(self) -> tuple[str, ...]:
         return (
             f"env_name={self.env_name}",
-            f"py_version={'.'.join(self._py_version_info)}",
             f"is_versioned_layer={self.env_spec.versioned}",
         )
 
@@ -1488,9 +1497,9 @@ class LayerEnvBase(ABC):
         if create_env:
             self._create_new_environment(lock_only=lock_only)
         env_lock = self.env_lock
-        if env_lock.has_valid_lock or not env_lock.versioned:
-            # Versioned layers need an up to date lock to write the deployed config
+        if not env_lock.versioned or env_lock.has_valid_lock:
             # Unversioned deployed config can be written regardless of the lock status
+            # Versioned layers need an up to date version to write the deployed config
             self._write_deployed_config()
         self.was_created = create_env
         self.was_built = create_env or env_updated
@@ -1696,12 +1705,19 @@ class LayerEnvBase(ABC):
                 f"Resetting lock for {self.env_name} (removing {str(requirements_path)!r})"
             )
             requirements_path.unlink()
-        print(f"Locking {self.env_name} (generating {str(requirements_path)!r})")
-        self._run_uv_pip_compile(
-            requirements_path, declared_requirements_path, constraint_paths
+        want_full_lock = (
+            self.want_lock or self.want_lock_reset or self.env_lock.needs_full_lock
         )
-        if not requirements_path.exists():
-            self._fail_build(f"Failed to generate {str(requirements_path)!r}")
+        if want_full_lock:
+            print(f"Locking {self.env_name} (generating {str(requirements_path)!r})")
+            self._run_uv_pip_compile(
+                requirements_path, declared_requirements_path, constraint_paths
+            )
+            if not requirements_path.exists():
+                self._fail_build(f"Failed to generate {str(requirements_path)!r}")
+        else:
+            print(f"Incrementing layer version for {self.env_name}")
+            # Actually doing the update is handled in `update_lock_metadata`
         self._write_package_summary()
         if self.env_lock.update_lock_metadata():
             print(f"  Environment lock time set: {self.env_lock.locked_at!r}")
@@ -2059,6 +2075,7 @@ class LayeredEnvBase(LayerEnvBase):
         assert base_python_path is not None
         print(f"Linking {str(env_python_path)!r} -> {str(base_python_path)!r}...")
         env_python_path.unlink(missing_ok=True)
+        env_python_path.parent.mkdir(parents=True, exist_ok=True)
         env_python_path.symlink_to(base_python_path)
         # Ensure python_, pythonX and pythonX.Y are relative links to ./python
         env_python_dir = env_python_path.parent
@@ -2177,6 +2194,7 @@ class LayeredEnvBase(LayerEnvBase):
         assert base_python_path is not None
         print(f"Linking {str(wrapper_bypass_path)!r} -> {str(base_python_path)!r}...")
         wrapper_bypass_path.unlink(missing_ok=True)
+        wrapper_bypass_path.parent.mkdir(parents=True, exist_ok=True)
         wrapper_bypass_path.symlink_to(base_python_path)
         # Ensure pythonX and pythonX.Y are relative links to ./python
         py_major, py_minor = self._py_version_info
@@ -2263,6 +2281,7 @@ class ApplicationEnv(LayeredEnvBase):
 
     launch_module_name: str = field(init=False, repr=False)
     _launch_module_hash: str = field(init=False, repr=False)
+    _support_module_info: list[SupportModuleMetadata] = field(init=False, repr=False)
 
     @property
     def env_spec(self) -> ApplicationSpec:
@@ -2273,41 +2292,71 @@ class ApplicationEnv(LayeredEnvBase):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        launch_module_path = self.env_spec.launch_module_path
+        env_spec = self.env_spec
+        # Launch module details
+        launch_module_path = env_spec.launch_module_path
         self.launch_module_name = launch_module_path.stem
-        if launch_module_path.is_file():
-            launch_module_hash = _hash_file_name_and_contents(launch_module_path)
-        else:
-            launch_module_hash = _hash_directory(launch_module_path)
+        launch_module_hash = hash_module(
+            launch_module_path, walk_iter=self.source_filter.walk
+        )
         self._launch_module_hash = launch_module_hash
-        self.env_lock.append_other_input(launch_module_hash)
+        _append_version_input = self.env_lock.append_version_input
+        _append_version_input(launch_module_hash)
+        # Support module details
+        support_module_info: list[SupportModuleMetadata] = []
+        for support_module_path in env_spec.support_module_paths:
+            support_module_name = support_module_path.stem
+            support_module_hash = hash_module(
+                support_module_path, walk_iter=self.source_filter.walk
+            )
+            _append_version_input(support_module_hash)
+            support_module_info.append(
+                {
+                    "name": support_module_name,
+                    "hash": support_module_hash,
+                }
+            )
+        self._support_module_info = support_module_info
+
+    def _sync_app_module(self, src: Path, dest: Path) -> None:
+        # To ensure the timestamps in the layer archive are *always* clamped,
+        # we intentionally *don't* copy the launch module file metadata here
+        if src.is_file():
+            shutil.copyfile(src, dest)
+        else:
+            shutil.copytree(
+                src,
+                dest,
+                dirs_exist_ok=True,
+                copy_function=shutil.copyfile,
+                ignore=self.source_filter.ignore,
+            )
+            # Also override the copied directory timestamps
+            for copied_path, _subdirs, _files in walk_path(dest):
+                copied_path.touch()
 
     def _update_existing_environment(self, *, lock_only: bool = False) -> None:
         super()._update_existing_environment(lock_only=lock_only)
-        # Also publish the specified launch module as an importable top level module
-        launch_module_source_path = self.env_spec.launch_module_path
-        launch_module_env_path = self.pylib_path / launch_module_source_path.name
+        # Also publish the specified launch module and any
+        # support modules as importable top level modules
+        env_spec = self.env_spec
+        pylib_path = self.pylib_path
+        launch_module_source_path = env_spec.launch_module_path
+        launch_module_env_path = pylib_path / launch_module_source_path.name
         print(f"Including launch module {launch_module_source_path!r}...")
-        # To ensure the timestamps in the layer archive are *always* clamped,
-        # we intentionally *don't* copy the launch module file metadata here
-        if launch_module_source_path.is_file():
-            shutil.copyfile(launch_module_source_path, launch_module_env_path)
-        else:
-            shutil.copytree(
-                launch_module_source_path,
-                launch_module_env_path,
-                dirs_exist_ok=True,
-                copy_function=shutil.copyfile,
-            )
-            # Also override the copied directory timestamps
-            # Python 3.11 compatibility: use os.walk instead of Path.walk
-            for this_dir, _subdirs, _files in os.walk(launch_module_env_path):
-                Path(this_dir).touch()
+        self._sync_app_module(launch_module_source_path, launch_module_env_path)
+        for support_module_source_path in env_spec.support_module_paths:
+            support_module_env_path = pylib_path / support_module_source_path.name
+            print(f"Including support module {support_module_source_path!r}...")
+            self._sync_app_module(support_module_source_path, support_module_env_path)
 
     def _update_output_metadata(self, metadata: LayerSpecMetadata) -> None:
         super()._update_output_metadata(metadata)
         metadata["app_launch_module"] = self.launch_module_name
         metadata["app_launch_module_hash"] = self._launch_module_hash
+        if self._support_module_info:
+            # Only include this field if the layer defines support modules
+            metadata["app_support_modules"] = self._support_module_info
 
     def get_deployed_config(
         self,
@@ -2582,22 +2631,45 @@ class StackSpec:
             if name in applications:
                 msg = f"Application names must be distinct ({name!r} already defined)"
                 raise LayerSpecError(msg)
-            launch_module_path = spec_dir_path / app.pop("launch_module")
-            if not launch_module_path.exists():
-                msg = f"Specified launch module {str(launch_module_path)!r} does not exist)"
-                raise LayerSpecError(msg)
             err_prefix = f"Application {name!r}"
             runtime_dep, framework_deps = cls._resolve_layer_deps(
                 err_prefix, app, runtimes, frameworks
             )
             app["runtime"] = runtime_dep
             app["frameworks"] = framework_deps
+            launch_module = app.pop("launch_module")
+            launch_module_path = spec_dir_path / launch_module
+            launch_module_name = launch_module_path.stem
+            support_modules = sorted(app.pop("support_modules", ()))
+            support_module_paths = [spec_dir_path / m for m in support_modules]
+            support_module_names = [p.stem for p in support_module_paths]
+            unique_support_module_names = set(support_module_names)
+            if launch_module_name in support_module_names:
+                msg = f"Launch module {launch_module_name!r} conflicts with support module in app layer {name!r}"
+                raise LayerSpecError(msg)
+            if len(unique_support_module_names) < len(support_module_names):
+                msg = f"Conflicting support module names in app layer {name!r}"
+                raise LayerSpecError(msg)
             app["launch_module_path"] = launch_module_path
+            app["support_module_paths"] = support_module_paths
             ensure_optional_env_spec_fields(app)
             applications[name] = ApplicationSpec(**app)
-        return cls(
+        self = cls(
             stack_spec_path, runtimes, frameworks, applications, requirements_dir_path
         )
+        build_platform = self.build_platform
+        for app_spec in self.applications.values():
+            if not app_spec.targets_platform(build_platform):
+                continue
+            if not app_spec.launch_module_path.exists():
+                msg = f"Specified launch module {str(launch_module_path)!r} does not exist"
+                raise LayerSpecError(msg)
+            missing_paths = [p for p in app_spec.support_module_paths if not p.exists()]
+            if missing_paths:
+                missing_module_info = "\n    ".join(map(str, missing_paths))
+                msg = f"Specified support modules do not exist:\n    {missing_module_info}"
+                raise LayerSpecError(msg)
+        return self
 
     def all_environment_specs(self) -> Iterator[LayerSpecBase]:
         """Iterate over the specifications for all defined environments.
@@ -2612,6 +2684,7 @@ class StackSpec:
         self,
         build_path: Path,
         index_config: PackageIndexConfig,
+        source_filter: SourceTreeContentFilter,
         env_class: type[BuildEnv],
         specs: Mapping[LayerBaseName, LayerSpecBase],
     ) -> MutableMapping[LayerBaseName, BuildEnv]:
@@ -2619,13 +2692,20 @@ class StackSpec:
         build_environments: dict[LayerBaseName, BuildEnv] = {}
         build_platform = self.build_platform
         for name, spec in specs.items():
-            if build_platform not in spec.platforms:
+            if not spec.targets_platform(build_platform):
                 print(f"  Skipping env {name!r} as it does not target this platform")
                 continue
             requirements_path = spec.get_requirements_path(
                 build_platform, requirements_dir
             )
-            build_env = env_class(spec, build_path, requirements_path, index_config)
+            # TODO: Make "source_filter" configurable once there is more than one filter defined
+            build_env = env_class(
+                spec,
+                build_path,
+                requirements_path,
+                index_config,
+                source_filter,
+            )
             build_environments[name] = build_env
             print(f"  Defined {name!r}: {build_env}")
         return build_environments
@@ -2644,20 +2724,21 @@ class StackSpec:
         if index_config is None:
             index_config = PackageIndexConfig()
         index_config.resolve_lexical_paths(self.spec_path.parent)
+        source_filter = get_default_source_filter(self.spec_path.parent)
         print("Defining runtime environments:")
         runtimes = self._define_envs(
-            build_path, index_config, RuntimeEnv, self.runtimes
+            build_path, index_config, source_filter, RuntimeEnv, self.runtimes
         )
         print("Defining framework environments:")
         frameworks = self._define_envs(
-            build_path, index_config, FrameworkEnv, self.frameworks
+            build_path, index_config, source_filter, FrameworkEnv, self.frameworks
         )
         for fw_env in frameworks.values():
             runtime = runtimes[fw_env.env_spec.runtime.name]
             fw_env.link_layered_environments(runtime, frameworks)
         print("Defining application environments:")
         applications = self._define_envs(
-            build_path, index_config, ApplicationEnv, self.applications
+            build_path, index_config, source_filter, ApplicationEnv, self.applications
         )
         for app_env in applications.values():
             runtime = runtimes[app_env.env_spec.runtime.name]
