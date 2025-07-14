@@ -503,16 +503,31 @@ on how the relative order of the application layer <code class="docutils literal
 the stack specification file) that specifies a Python module or import package that will
 be included in the built environment for execution with the <a class="reference external" href="https://docs.python.org/3/using/cmdline.html#cmdoption-m" title="(in Python v3.13)"><code class="xref std std-option docutils literal notranslate"><span class="pre">-m</span></code></a> switch.</p></li>
 </ul>
-<div class="admonition note">
-<p class="admonition-title">Note</p>
-<p>updating the launch module contents does <em>not</em> implicitly update the lock version
-for implicitly versioned environments (but it does update the <code class="docutils literal notranslate"><span class="pre">archive_build</span></code>
-field for published artifacts).</p>
-</div>
+<p>Application layer specifications may also contain the following optional field:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">support_modules</span></code> (<a class="extlink-toml reference external" href="https://toml.io/en/v1.0.0#array">array</a> of <a class="extlink-toml reference external" href="https://toml.io/en/v1.0.0#string">strings</a>):
+an array of relative paths (each starting from the folder containing the stack specification
+file) that specify Python modules or import packages that will be included in the built
+environment for use by the application launch module.</p></li>
+</ul>
+<p>Refer to <a class="reference internal" href="#source-tree-content-filtering"><span class="std std-ref">Source tree content filtering</span></a> for details on exactly which files will be
+included in the application layer from referenced launch modules and support modules.</p>
 <div class="versionchanged">
 <p><span class="versionmodified changed">Changed in version 0.4.0: </span>Added the ability for application layers to depend directly on a runtime layer instead
 of declaring that they depend on one or more framework layers
 (<a class="reference internal" href="../changelog/#changelog-0-4-0"><span class="std std-ref">release details</span></a>).</p>
+</div>
+<div class="versionchanged">
+<p><span class="versionmodified changed">Changed in version 0.5.0: </span>Updating the name or contents of a launch module also updates the layer version
+for implicitly versioned layers
+(<a class="reference internal" href="../changelog/#changelog-0-5-0"><span class="std std-ref">release details</span></a>).</p>
+</div>
+<div class="versionadded">
+<p><span class="versionmodified added">Added in version 0.6.0: </span>Added the <code class="docutils literal notranslate"><span class="pre">support_modules</span></code> field (<a class="reference internal" href="../changelog/#changelog-0-6-0"><span class="std std-ref">release details</span></a>).</p>
+</div>
+<div class="versionadded">
+<p><span class="versionmodified added">Added in version 0.6.0: </span>Source tree content filtering for launch modules and support modules
+(<a class="reference internal" href="../changelog/#changelog-0-6-0"><span class="std std-ref">release details</span></a>).</p>
 </div>
 </section>
 <section id="linearizing-the-python-import-path">
@@ -568,6 +583,21 @@ configuration and output metadata</p></li>
 <p>Layers with implicit lock versioning enabled will instead use
 <code class="docutils literal notranslate"><span class="pre">&quot;{layer_name}&#64;{lock_version}&quot;</span></code> for these deployment related purposes.</p>
 </section>
+<section id="source-tree-content-filtering">
+<span id="id1"></span><h3>Source tree content filtering<a class="headerlink" href="#source-tree-content-filtering" title="Link to this heading">¶</a></h3>
+<p>Application layer launch modules and support modules may be either single
+files or directories defining a Python import package. In the latter
+case, the contents of the source tree are filtered to exclude unwanted files
+rather than including every file in the specified directory.</p>
+<p>When git source control information is available, any files explicitly
+excluded from source control will also be omitted from the application
+layers (that is, the exclusions are based on <code class="docutils literal notranslate"><span class="pre">.gitignore</span></code> patterns).
+Any files or folders with names starting with <code class="docutils literal notranslate"><span class="pre">.git</span></code> are also excluded.</p>
+<p>If no recognised source control information is found, the source tree
+content filtering defaults to simply excluding <code class="docutils literal notranslate"><span class="pre">__pycache__</span></code> folders
+(as these may be generated if the launch modules or support modules are
+imported for testing purposes from their source tree location).</p>
+</section>
 <section id="deprecated-fields">
 <h3>Deprecated fields<a class="headerlink" href="#deprecated-fields" title="Link to this heading">¶</a></h3>
 <p>The following field names were previously supported and now emit <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#FutureWarning" title="(in Python v3.13)"><code class="xref py py-exc docutils literal notranslate"><span class="pre">FutureWarning</span></code></a>
@@ -582,11 +612,12 @@ when used in a loaded stack specification:</p>
 <section id="locked-layer-requirements">
 <span id="layer-requirements"></span><h2>Locked layer requirements<a class="headerlink" href="#locked-layer-requirements" title="Link to this heading">¶</a></h2>
 <p>Environment lock metadata files saved alongside the layer’s transitively locked requirements file:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">requirements_hash</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># Uses &quot;algorithm:hexdigest&quot; format</span>
-<span class="n">lock_input_hash</span><span class="p">:</span> <span class="nb">str</span>    <span class="c1"># Uses &quot;algorithm:hexdigest&quot; format</span>
-<span class="n">other_inputs_hash</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># Uses &quot;algorithm:hexdigest&quot; format</span>
-<span class="n">lock_version</span><span class="p">:</span> <span class="nb">int</span>       <span class="c1"># Auto-incremented from previous lock metadata</span>
-<span class="n">locked_at</span><span class="p">:</span> <span class="nb">str</span>          <span class="c1"># ISO formatted date/time value</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">requirements_hash</span><span class="p">:</span> <span class="nb">str</span>   <span class="c1"># Uses &quot;algorithm:hexdigest&quot; format</span>
+<span class="n">lock_input_hash</span><span class="p">:</span> <span class="nb">str</span>     <span class="c1"># Uses &quot;algorithm:hexdigest&quot; format</span>
+<span class="n">other_inputs_hash</span><span class="p">:</span> <span class="nb">str</span>   <span class="c1"># Uses &quot;algorithm:hexdigest&quot; format</span>
+<span class="n">version_inputs_hash</span><span class="p">:</span> <span class="nb">str</span> <span class="c1"># Uses &quot;algorithm:hexdigest&quot; format</span>
+<span class="n">lock_version</span><span class="p">:</span> <span class="nb">int</span>        <span class="c1"># Auto-incremented from previous lock metadata</span>
+<span class="n">locked_at</span><span class="p">:</span> <span class="nb">str</span>           <span class="c1"># ISO formatted date/time value</span>
 </pre></div>
 </div>
 <p>Note: A future documentation update will cover these <code class="docutils literal notranslate"><span class="pre">venvstacks</span> <span class="pre">lock</span></code> output files in additional detail.</p>
@@ -726,6 +757,7 @@ including the effects of the <code class="docutils literal notranslate"><span cl
 <li><a class="reference internal" href="#application-layer-specification-fields">Application layer specification fields</a></li>
 <li><a class="reference internal" href="#linearizing-the-python-import-path">Linearizing the Python import path</a></li>
 <li><a class="reference internal" href="#layer-names-and-versioning">Layer names and versioning</a></li>
+<li><a class="reference internal" href="#source-tree-content-filtering">Source tree content filtering</a></li>
 <li><a class="reference internal" href="#deprecated-fields">Deprecated fields</a></li>
 </ul>
 </li>

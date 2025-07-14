@@ -44,48 +44,98 @@ The environment layers to be published are defined in a ``venvstacks.toml`` stac
 with a separate array of tables for each kind of layer definition.
 
 For example, the following specification defines a pair of applications which use
-`scikit-learn <https://scikit-learn.org/>`__ as a shared framework layer with
-`numpy <https://numpy.org/>`__ preinstalled in the runtime layer,
-all running in a controlled Python 3.11 base runtime:
+`scikit-learn <https://scikit-learn.org/>`__ and
+`Qt for Python <https://doc.qt.io/qtforpython-6/>`__ (wrapping Qt 6) as shared framework layers
+with `numpy <https://numpy.org/>`__ and `matplotlib <https://matplotlib.org/>`__ preinstalled
+in the runtime layer, all running in a controlled Python 3.11 base runtime:
 
-.. code-block:: toml
+.. literalinclude:: ../examples/sklearn/venvstacks.toml
+  :language: TOML
 
-   [[runtimes]]
-   name = "cpython-3.11"
-   python_implementation = "cpython@3.11.10"
-   requirements = [
-       "numpy",
-   ]
+.. _command-show:
+.. _option-show:
+.. _option-show-only:
+.. _option-json:
 
-   [[frameworks]]
-   name = "sklearn"
-   runtime = "cpython-3.11"
-   requirements = [
-       "scikit-learn",
-   ]
+Viewing environment stack status
+--------------------------------
 
-   [[applications]]
-   name = "classification-demo"
-   launch_module = "launch_modules/sklearn_classification.py"
-   frameworks = ["sklearn"]
-   requirements = [
-       "scikit-learn",
-   ]
+The `show` subcommand displays the current status of the layers in the given
+environment stack specification.
 
-   [[applications]]
-   name = "clustering-demo"
-   launch_module = "launch_modules/sklearn_clustering.py"
-   frameworks = ["sklearn"]
-   requirements = [
-       "scikit-learn",
-   ]
+.. code-block:: console
+
+   $ venvstacks show examples/sklearn/venvstacks.toml
+   /absolute/path/to/examples/sklearn/venvstacks.toml
+   ├── Runtimes
+   │   └── cpython-3.11
+   ├── Frameworks
+   │   ├── framework-sklearn
+   │   │   └── cpython-3.11
+   │   └── framework-gui
+   │       └── cpython-3.11
+   └── Applications
+      ├── app-classification-demo
+      │   ├── framework-sklearn
+      │   ├── framework-gui
+      │   └── cpython-3.11
+      └── app-clustering-demo
+         ├── framework-sklearn
+         ├── framework-gui
+         └── cpython-3.11
+
+Each environment is listed within its category in definition order. The
+declared dependencies of each environment (both direct and indirect)
+are listed in the order in which they will appear on ``sys.path`` for
+that environment.
+
+The ``--include`` option allows the displayed tree to be filtered to just
+the layers matching the given wildcard patterns, together with the layers
+that those layers depend on and the layers that depend on the included layers.
+
+.. code-block:: console
+
+   $ pdm run venvstacks show --include 'app-cluster*' examples/sklearn/venvstacks.toml
+   /home/acoghlan/devel/venvstacks/examples/sklearn/venvstacks.toml
+   ├── Runtimes
+   │   └── cpython-3.11
+   ├── Frameworks
+   │   ├── framework-sklearn
+   │   │   └── cpython-3.11
+   │   └── framework-gui
+   │       └── cpython-3.11
+   └── Applications
+      └── app-clustering-demo
+         ├── framework-sklearn
+         ├── framework-gui
+         └── cpython-3.11
+
+Any layers that do not currently have a valid lock file are shown with a
+leading ``*``. Layers which are deployed to a target folder other than the
+name used for their build folder (for example, due to the use of implicit layer
+versioning) are shown using a "build-name -> deployment-name" notation.
+
+The ``--json`` option can be used to emit a JSON data structure instead of
+a human readable tree.
+
+The operation subcommands support a ``--show`` option to display the layers
+affected by the command and the operations that will be performed on those
+layers before proceeding on to the requested operation. These subcommands
+also support a ``--show-only`` option that displays the included layers and
+operations *without* continuing on with the operation itself.
+
+The operation subcommands also support the ``--include`` and ``--json`` options
+supported by ``show``. If ``--json`` is specified, it implies ``--show-only``
+unless ``--show`` is specified explicitly on the command line.
+
+.. versionadded:: 0.7.0
 
 Locking environment stacks
 --------------------------
 
 .. code-block:: console
 
-   $ venvstacks lock sklearn_demo/venvstacks.toml
+   $ venvstacks lock examples/sklearn/venvstacks.toml
 
 The ``lock`` subcommand takes the defined layer requirements from the specification,
 and uses them to perform a complete combined resolution of all of the environment stacks
@@ -101,7 +151,7 @@ Building environment stacks
 
 .. code-block:: console
 
-   $ venvstacks build sklearn_demo/venvstacks.toml
+   $ venvstacks build examples/sklearn/venvstacks.toml
 
 The ``build`` subcommand performs the step of converting the layer specifications
 and their locked requirements into a working Python environment
@@ -118,7 +168,7 @@ Publishing environment layer archives
 
 .. code-block:: console
 
-   $ venvstacks publish --tag-outputs --output-dir demo_artifacts sklearn_demo/venvstacks.toml
+   $ venvstacks publish --tag-outputs --output-dir demo_artifacts examples/sklearn/venvstacks.toml
 
 Once the environments have been successfully built,
 the ``publish`` command allows each layer to be converted to a separate
@@ -139,7 +189,7 @@ Locally exporting environment stacks
 
 .. code-block:: console
 
-   $ venvstacks local-export --output-dir demo_export sklearn_demo/venvstacks.toml 
+   $ venvstacks local-export --output-dir demo_export examples/sklearn/venvstacks.toml 
 
 Given that even considering the use of ``venvstacks`` implies that some layer archives may be of
 significant size (a fully built :pypi:`PyTorch <torch>` archive weighs in at multiple gigabytes,
